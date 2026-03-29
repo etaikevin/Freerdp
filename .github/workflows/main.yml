@@ -1,0 +1,97 @@
+name: RDP
+
+on:
+  workflow_dispatch:
+
+jobs:
+  secure-rdp:
+    runs-on: windows-latest
+    timeout-minutes: 4320   # 72 hours max
+
+    steps:
+      - name: Enable RDP
+        run: |
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+            -Name "fDenyTSConnections" -Value 0 -Force
+
+          # Enable firewall for RDP
+          netsh advfirewall firewall add rule name="RDP" dir=in action=allow protocol=TCP localport=3389
+
+          Restart-Service -Name TermService -Force
+
+      - name: Create RDP User
+        run: |
+          Add-Type -AssemblyName System.Security
+
+          $charSet = @{
+              Upper   = [char[]](65..90)
+              Lower   = [char[]](97..122)
+              Number  = [char[]](48..57)
+              Special = ([char[]](33..47) + [char[]](58..64) +
+                         [char[]](91..96) + [char[]](123..126))
+          }
+
+          $password = -join (
+              ($charSet.Upper   | Get-Random -Count 3) +
+              ($charSet.Lower   | Get-Random -Count 3) +
+              ($charSet.Number  | Get-Random -Count 3) +
+              ($charSet.Special | Get-Random -Count 3) |
+              Sort-Object { Get-Random }
+          )
+
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+
+          New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
+          Add-LocalGroupMember -Group "Administrators" -Member "RDP"
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
+
+          echo "RDP_PASSWORD=$password" >> $env:GITHUB_ENV
+
+      - name: Install Tailscale
+        run: |
+          $url = "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi"
+          $file = "$env:TEMP\tailscale.msi"
+
+          Invoke-WebRequest $url -OutFile $file
+          Start-Process msiexec.exe -ArgumentList "/i `"$file`" /quiet /norestart" -Wait
+          Remove-Item $file -Force
+
+          Start-Sleep -Seconds 10
+
+      - name: Connect Tailscale
+        run: |
+          if (-not "${{ secrets.TAILSCALE_AUTH_KEY }}") {
+            Write-Error "TAILSCALE_AUTH_KEY missing"
+            exit 1
+          }
+
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up `
+            --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} `
+            --hostname=gh-runner-$env:GITHUB_RUN_ID
+
+          Start-Sleep -Seconds 10
+
+          $ip = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+
+          if (-not $ip) {
+            Write-Error "No Tailscale IP assigned"
+            exit 1
+          }
+
+          echo "TS_IP=$ip" >> $env:GITHUB_ENV
+
+      - name: Show Connection Info
+        run: |
+          Write-Host "==============================="
+          Write-Host "RDP READY"
+          Write-Host "IP: $env:TS_IP"
+          Write-Host "User: RDP"
+          Write-Host "Password: $env:RDP_PASSWORD"
+          Write-Host "==============================="
+
+      - name: Keep Alive (72h max)
+        run: |
+          for ($i=0; $i -lt 864; $i++) {
+            Write-Host "Running... $i"
+            Start-Sleep -Seconds 300
+          }
